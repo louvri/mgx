@@ -594,23 +594,33 @@ func (pg *pager) lookup(doc bson.Raw, i int) (bson.RawValue, error) {
 		}
 		return v, fmt.Errorf("cannot page: sort field %q is missing in a result", field)
 	}
+	if why := unpageable(v); why != "" {
+		return v, fmt.Errorf("cannot page: sort field %q is %s in a result", field, why)
+	}
+	return v, nil
+}
+
+// unpageable says why no cursor can resume at v, or returns "" if one can.
+// It guards both the results a cursor is built from and the cursors a
+// caller hands back.
+func unpageable(v bson.RawValue) string {
 	switch v.Type {
-	case bson.TypeNull, bson.TypeUndefined:
-		return v, fmt.Errorf("cannot page: sort field %q is null in a result", field)
-	case bson.TypeDouble, bson.TypeDecimal128:
-		// NaN equals nothing and is not ordered against numbers in a filter,
-		// so neither a page after it nor one before it can be asked for.
-		f, isDouble := v.DoubleOK()
-		d, isDecimal := v.Decimal128OK()
-		if (isDouble && math.IsNaN(f)) || (isDecimal && d.IsNaN()) {
-			return v, fmt.Errorf("cannot page: sort field %q is NaN in a result", field)
-		}
+	case 0, bson.TypeNull, bson.TypeUndefined:
+		return "null"
 	case bson.TypeArray:
 		// An array sorts by one of its elements, but compares as a whole or
 		// element-wise in a filter, so no condition resumes after it.
-		return v, fmt.Errorf("cannot page: sort field %q holds an array in a result", field)
+		return "an array"
+	case bson.TypeDouble, bson.TypeDecimal128:
+		// NaN equals nothing and is not ordered against numbers in a filter,
+		// so no condition resumes after it either.
+		f, isDouble := v.DoubleOK()
+		d, isDecimal := v.Decimal128OK()
+		if (isDouble && math.IsNaN(f)) || (isDecimal && d.IsNaN()) {
+			return "NaN"
+		}
 	}
-	return v, nil
+	return ""
 }
 
 // mayTie reports whether two sort values can sort as equal. idKey tells
@@ -669,6 +679,13 @@ func afterFilter(keys []sortKey, cursor string, strict bool) (bson.D, []bson.Raw
 	}
 	if want := keyNames(keys); len(tok.Values) != len(want) || !slices.Equal(tok.Keys, want) {
 		return nil, nil, fmt.Errorf("%w: issued for order %v, used with %v", ErrInvalidCursor, tok.Keys, want)
+	}
+	// mgx never issues these, so the cursor is corrupt or forged. A NaN, say,
+	// would otherwise pass as a number and silently restart from page one.
+	for i, v := range tok.Values {
+		if why := unpageable(v); why != "" {
+			return nil, nil, fmt.Errorf("%w: value for %q is %s", ErrInvalidCursor, keys[i].field, why)
+		}
 	}
 	or := make(bson.A, 0, len(keys))
 	for i, k := range keys {

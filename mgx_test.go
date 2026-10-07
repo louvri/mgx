@@ -2,6 +2,7 @@ package mgx
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math"
@@ -196,6 +197,21 @@ func TestCursorRoundTrip(t *testing.T) {
 	}
 	if _, _, err := afterFilter(keys, "AAAA", true); !errors.Is(err, ErrInvalidCursor) {
 		t.Errorf("non-bson cursor: %v", err)
+	}
+	// A cursor carrying a value mgx would never issue is corrupt or forged.
+	forge := func(v any) string {
+		ty, b, _ := bson.MarshalValue(v)
+		vals := []bson.RawValue{{Type: bson.TypeString, Value: after[0].Value}, {Type: ty, Value: b}, after[2]}
+		raw, _ := bson.Marshal(cursorToken{Keys: keyNames(keys), Values: vals})
+		return base64.RawURLEncoding.EncodeToString(raw)
+	}
+	for name, v := range map[string]any{"NaN": math.NaN(), "null": nil, "array": bson.A{1}} {
+		if _, _, err := afterFilter(keys, forge(v), true); !errors.Is(err, ErrInvalidCursor) {
+			t.Errorf("cursor holding %s: %v", name, err)
+		}
+	}
+	if _, _, err := afterFilter(keys, forge(int32(30)), true); err != nil {
+		t.Errorf("control: a well-formed forged cursor was rejected: %v", err)
 	}
 
 	// Every result is checked: a sort value that cannot be paged past, or
