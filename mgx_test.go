@@ -199,18 +199,33 @@ func TestCursorRoundTrip(t *testing.T) {
 		t.Errorf("non-bson cursor: %v", err)
 	}
 	// A cursor carrying a value mgx would never issue is corrupt or forged.
-	forge := func(v any) string {
-		ty, b, _ := bson.MarshalValue(v)
-		vals := []bson.RawValue{{Type: bson.TypeString, Value: after[0].Value}, {Type: ty, Value: b}, after[2]}
-		raw, _ := bson.Marshal(cursorToken{Keys: keyNames(keys), Values: vals})
+	// Each case must reach the value check, not fail earlier as malformed
+	// BSON, so the error is matched on the reason it names.
+	value := func(v any) bson.RawValue {
+		ty, b, err := bson.MarshalValue(v)
+		if err != nil {
+			t.Fatalf("marshal %v: %v", v, err)
+		}
+		return bson.RawValue{Type: ty, Value: b}
+	}
+	forge := func(age bson.RawValue) string {
+		raw, err := bson.Marshal(cursorToken{Keys: keyNames(keys), Values: []bson.RawValue{after[0], age, after[2]}})
+		if err != nil {
+			t.Fatal(err)
+		}
 		return base64.RawURLEncoding.EncodeToString(raw)
 	}
-	for name, v := range map[string]any{"NaN": math.NaN(), "null": nil, "array": bson.A{1}} {
-		if _, _, err := afterFilter(keys, forge(v), true); !errors.Is(err, ErrInvalidCursor) {
-			t.Errorf("cursor holding %s: %v", name, err)
+	for why, v := range map[string]bson.RawValue{
+		"NaN":      value(math.NaN()),
+		"null":     {Type: bson.TypeNull},
+		"an array": value(bson.A{1}),
+	} {
+		_, _, err := afterFilter(keys, forge(v), true)
+		if !errors.Is(err, ErrInvalidCursor) || !strings.HasSuffix(err.Error(), `"meta.age" is `+why) {
+			t.Errorf("cursor holding %s: %v", why, err)
 		}
 	}
-	if _, _, err := afterFilter(keys, forge(int32(30)), true); err != nil {
+	if _, _, err := afterFilter(keys, forge(value(int32(30))), true); err != nil {
 		t.Errorf("control: a well-formed forged cursor was rejected: %v", err)
 	}
 
