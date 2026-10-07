@@ -112,9 +112,11 @@ page, next, err := mgx.Query[User](db, "users").
 
 The cursor records the last document's sort values; the next page asks for documents that sort after them. `_id` is appended to the ordering as a tie-breaker. This needs three things of the data:
 
-- every sort field is present, non-null and not an array on every matching document;
-- each sort field holds one BSON type across documents;
+- every sort field is present, non-null, not NaN and not an array on every matching document;
+- each sort field holds one BSON type (all numeric types count as one) across the documents that tie on the fields before it - for the first field, every matching document. The `_id` mgx appends may mix types under a unique field;
 - an index covering the filter and the full ordering, ending in `_id`.
+
+A page holding a document that breaks either of the first two fails with an error. Paging never skips such a document silently: the next page asks for everything that does not sort before the cursor, so a document of another type, or one missing the field, surfaces rather than being passed over.
 
 A cursor is tied to the ordering it was issued for; using it with another returns `ErrInvalidCursor`. When a page comes back empty, the cursor passed in is returned unchanged. The cursor is not signed or encrypted: it can only move a reader within the query it is used with, but treat it as client input, and remember that anyone holding it can decode the last document's sort values and `_id`. Offset and cursor pagination are mutually exclusive (`ErrPaginationConflict`).
 
@@ -133,7 +135,7 @@ err  = mgx.DeleteByID(ctx, db, "users", "user-123")                   // deletin
 n, err := mgx.DeleteMultiByID(ctx, db, "users", []string{"a", "b"})
 ```
 
-The write calls address documents by id only, so a builder carrying a filter, ordering, projection or pagination is rejected rather than having it silently ignored - a dropped tenant filter would otherwise overwrite another tenant's document. A nil or empty id is rejected everywhere, including inside the batch calls, since a nil pointer would otherwise address the document whose `_id` is null. Batch writes go in requests of 500 and lookups in requests of 1000. Each request is independent, so a failure part-way leaves earlier batches applied; for all-or-nothing, write inside a transaction.
+The write calls address documents by id only, so a builder carrying a filter, ordering, projection or pagination is rejected rather than having it silently ignored - a dropped tenant filter would otherwise overwrite another tenant's document. A nil or empty id is rejected everywhere, including inside the batch calls, since a nil pointer would otherwise address the document whose `_id` is null. Batch writes go in requests of 500 and lookups in requests of 1000. Each request is independent, so a failure part-way leaves earlier batches applied. `UpsertMulti` batches are also unordered, so some documents of the failing batch may be applied too. For all-or-nothing, write inside a transaction.
 
 ## Transactions
 
@@ -154,7 +156,7 @@ The transaction travels in the context handed to the callback: calls made with t
 
 - A kind is a collection and a key is the document's `_id`, which may be any type Firestore accepts (string, ObjectID, int32, int64, double, binary, document).
 - There are no namespaces and no ancestor queries.
-- Cursors are keyset tokens built by mgx, not server cursors.
+- Cursors are keyset tokens built by mgx, not server cursors. Datastore leaves out an entity that lacks a sort property; mgx fails the page instead, since MongoDB sorts such a document rather than dropping it.
 - `OpNotEqual` and `OpNotIn` also match documents that lack the field. Datastore skips those.
 - `Close` and every I/O call take a context.
 

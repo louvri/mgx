@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"reflect"
 	"strings"
@@ -144,51 +145,108 @@ func TestProjectionKeepsSortFields(t *testing.T) {
 
 func TestCursorRoundTrip(t *testing.T) {
 	keys := []sortKey{{field: "status"}, {field: "meta.age", desc: true}, {field: FieldID}}
-	last, _ := bson.Marshal(bson.D{
-		{Key: "_id", Value: "u7"},
-		{Key: "status", Value: "active"},
-		{Key: "meta", Value: bson.D{{Key: "age", Value: int32(30)}}},
-	})
-	tok, err := encodeCursor(keys, last)
+	doc := func(status, age any) bson.Raw {
+		d := bson.D{{Key: "_id", Value: "u7"}}
+		if status != nil {
+			d = append(d, bson.E{Key: "status", Value: status})
+		}
+		raw, _ := bson.Marshal(append(d, bson.E{Key: "meta", Value: bson.D{{Key: "age", Value: age}}}))
+		return raw
+	}
+	pg := newPager(keys, nil)
+	if err := pg.add(doc("active", int32(30))); err != nil {
+		t.Fatal(err)
+	}
+	tok, err := pg.cursor()
 	if err != nil {
 		t.Fatal(err)
 	}
-	f, err := afterFilter(keys, tok)
+	f, after, err := afterFilter(keys, tok, true)
 	if err != nil {
 		t.Fatal(err)
 	}
 	got, _ := bson.MarshalExtJSON(f, false, false)
 	want := `{"$or":[` +
+		`{"status":{"$not":{"$lte":"active"}}},` +
+		`{"status":{"$eq":"active"},"meta.age":{"$not":{"$gte":30}}},` +
+		`{"status":{"$eq":"active"},"meta.age":{"$eq":30},"_id":{"$not":{"$lte":"u7"}}}]}`
+	if string(got) != want {
+		t.Errorf("after filter =\n %s\nwant\n %s", got, want)
+	}
+	if len(after) != 3 || after[1].Int32() != 30 {
+		t.Errorf("cursor values = %v", after)
+	}
+	// Terminals that do not run the pager get the plain range condition.
+	f, _, _ = afterFilter(keys, tok, false)
+	got, _ = bson.MarshalExtJSON(f, false, false)
+	want = `{"$or":[` +
 		`{"status":{"$gt":"active"}},` +
 		`{"status":{"$eq":"active"},"meta.age":{"$lt":30}},` +
 		`{"status":{"$eq":"active"},"meta.age":{"$eq":30},"_id":{"$gt":"u7"}}]}`
 	if string(got) != want {
-		t.Errorf("after filter =\n %s\nwant\n %s", got, want)
+		t.Errorf("plain after filter =\n %s\nwant\n %s", got, want)
 	}
 
 	// A cursor is tied to the ordering it was issued for.
-	if _, err := afterFilter(keys[1:], tok); !errors.Is(err, ErrInvalidCursor) {
+	if _, _, err := afterFilter(keys[1:], tok, true); !errors.Is(err, ErrInvalidCursor) {
 		t.Errorf("cursor reused with another order: %v", err)
 	}
-	if _, err := afterFilter(keys, "not base64!"); !errors.Is(err, ErrInvalidCursor) {
+	if _, _, err := afterFilter(keys, "not base64!", true); !errors.Is(err, ErrInvalidCursor) {
 		t.Errorf("garbage cursor: %v", err)
 	}
-	if _, err := afterFilter(keys, "AAAA"); !errors.Is(err, ErrInvalidCursor) {
+	if _, _, err := afterFilter(keys, "AAAA", true); !errors.Is(err, ErrInvalidCursor) {
 		t.Errorf("non-bson cursor: %v", err)
 	}
 
-	// A missing or null sort value cannot be paged past, so it is an error.
-	noStatus, _ := bson.Marshal(bson.D{{Key: "_id", Value: "u1"}, {Key: "meta", Value: bson.D{{Key: "age", Value: 1}}}})
-	if _, err := encodeCursor(keys, noStatus); err == nil {
-		t.Error("missing sort field: expected an error")
+	// Every result is checked: a sort value that cannot be paged past, or
+	// one of another type than the cursor's, fails the page.
+	bad := map[string]bson.Raw{
+		"missing":         doc(nil, 1),
+		"null":            doc(bson.Null{}, 1),
+		"array":           doc(bson.A{"a", "b"}, 1),
+		"other type":      doc(int32(5), 1),
+		"other type, age": doc("active", "thirty"),
+		"NaN":             doc("active", math.NaN()),
 	}
-	nullStatus, _ := bson.Marshal(bson.D{{Key: "_id", Value: "u1"}, {Key: "status", Value: nil}, {Key: "meta", Value: bson.D{{Key: "age", Value: 1}}}})
-	if _, err := encodeCursor(keys, nullStatus); err == nil {
-		t.Error("null sort field: expected an error")
+	for name, d := range bad {
+		if err := newPager(keys, after).add(d); err == nil {
+			t.Errorf("%s sort value: expected an error", name)
+		}
 	}
-	arrayStatus, _ := bson.Marshal(bson.D{{Key: "_id", Value: "u1"}, {Key: "status", Value: bson.A{"a", "b"}}, {Key: "meta", Value: bson.D{{Key: "age", Value: 1}}}})
-	if _, err := encodeCursor(keys, arrayStatus); err == nil {
-		t.Error("array sort field: expected an error")
+	// Numeric widths are one type; the first result fixes it when not resuming.
+	if err := newPager(keys, after).add(doc("x", 2.5)); err != nil {
+		t.Errorf("double after an int32 cursor value: %v", err)
+	}
+	fresh := newPager(keys, nil)
+	if err := fresh.add(doc("a", 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := fresh.add(doc(int32(1), 1)); err == nil {
+		t.Error("a page mixing types: expected an error")
+	}
+
+	// A lower key's type only matters where the keys before it tie.
+	byName := []sortKey{{field: "name"}, {field: FieldID}}
+	row := func(name string, id any) bson.Raw {
+		raw, _ := bson.Marshal(bson.D{{Key: "_id", Value: id}, {Key: "name", Value: name}})
+		return raw
+	}
+	ids := newPager(byName, nil)
+	if err := ids.add(row("a", "s1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := ids.add(row("b", bson.NewObjectID())); err != nil {
+		t.Errorf("mixed _id types under a unique sort field: %v", err)
+	}
+	if err := ids.add(row("b", "s2")); err == nil {
+		t.Error("mixed _id types under a tie: expected an error")
+	}
+
+	// A dotted path through an array of documents is reported as an array.
+	items, _ := bson.Marshal(bson.D{{Key: "_id", Value: 1}, {Key: "items", Value: bson.A{bson.D{{Key: "price", Value: 5}}}}})
+	err = newPager([]sortKey{{field: "items.price"}}, nil).add(items)
+	if err == nil || !strings.Contains(err.Error(), "array") {
+		t.Errorf("path through an array: %v", err)
 	}
 }
 
@@ -233,13 +291,29 @@ func TestCheckIDRejectsNil(t *testing.T) {
 	for name, id := range map[string]any{
 		"nil": nil, "nil pointer": s, "nil map": m, "nil slice": b,
 		"empty string": "", "empty named string": userID(""), "pointer to empty string": new(""),
+		"bson null": bson.Null{}, "bson undefined": bson.Undefined{},
+		"raw null": bson.RawValue{Type: bson.TypeNull}, "raw empty string": bson.RawValue{Type: bson.TypeString, Value: []byte{1, 0, 0, 0, 0}},
+		"malformed raw string":   bson.RawValue{Type: bson.TypeString, Value: []byte{1}},
+		"pointer to nil pointer": &s, "pointer to bson null": &bson.Null{},
 	} {
-		if checkID(id) == nil {
+		if offline(t).checkID(id) == nil {
 			t.Errorf("%s id accepted", name)
 		}
 	}
-	if err := checkID(new("x")); err != nil {
+	if err := offline(t).checkID(new("x")); err != nil {
 		t.Errorf("non-nil pointer id rejected: %v", err)
+	}
+
+	// Inserts check the _id the document carries, if any.
+	type nullable struct {
+		ID   *string `bson:"_id"`
+		Name string  `bson:"name"`
+	}
+	if _, err := Query[nullable](offline(t), "u").Insert(context.Background(), &nullable{Name: "x"}); err == nil {
+		t.Error("insert of a null _id accepted")
+	}
+	if _, err := Query[nullable](offline(t), "u").InsertMulti(context.Background(), []*nullable{{ID: new("")}}); err == nil {
+		t.Error("insert-multi of an empty _id accepted")
 	}
 
 	// The bulk paths apply the same check, before any request is sent.
@@ -250,6 +324,29 @@ func TestCheckIDRejectsNil(t *testing.T) {
 	}
 	if _, err := DeleteMultiByID(ctx, db, "u", []string{"a", ""}); err == nil {
 		t.Error("delete-multi accepted an empty id")
+	}
+}
+
+// marshal mirrors the driver's encoder options by hand. A driver release that
+// adds a BSON option must fail here, not silently encode differently.
+func TestMarshalKnowsEveryBSONOption(t *testing.T) {
+	decodeOnly := map[string]bool{
+		"AllowTruncatingDoubles": true, "BinaryAsSlice": true, "DefaultDocumentM": true,
+		"DefaultDocumentMap": true, "ObjectIDAsHexString": true, "UseLocalTimeZone": true,
+		"ZeroMaps": true, "ZeroStructs": true,
+	}
+	for f := range reflect.TypeFor[options.BSONOptions]().Fields() {
+		var o options.BSONOptions
+		if f.Type.Kind() == reflect.Bool {
+			reflect.ValueOf(&o).Elem().FieldByIndex(f.Index).SetBool(true)
+		}
+		applied := len(encoderSetters(&o)) == 1
+		switch {
+		case decodeOnly[f.Name] && applied:
+			t.Errorf("BSONOptions.%s is listed as decode-only but encoderSetters applies it", f.Name)
+		case !decodeOnly[f.Name] && !applied:
+			t.Errorf("BSONOptions.%s is not applied by encoderSetters: add it there if it affects encoding, else to the decode-only list", f.Name)
+		}
 	}
 }
 
@@ -573,6 +670,47 @@ func TestLiveCursorPagination(t *testing.T) {
 	// Count honours the cursor.
 	if n, err := q().WithCursor(cursor).Count(ctx); err != nil || n != 14 {
 		t.Errorf("count after cursor = %d, %v", n, err)
+	}
+}
+
+// A document lacking a sort field cannot be paged past. Paging must fail
+// loudly on it in either direction, never finish early without it: under a
+// descending order it sorts last, after every page boundary.
+func TestLiveCursorMissingSortField(t *testing.T) {
+	db, ctx := live(t)
+	for name, odd := range map[string]bson.M{"missing": {}, "other type": {"bio": 7}} {
+		t.Run(name, func(t *testing.T) {
+			coll := fresh(t, db, ctx)
+			for i := range 25 {
+				doc := bson.M{"bio": fmt.Sprintf("b%02d", i)}
+				if i >= 20 {
+					doc = odd
+				}
+				if err := Query[bson.M](db, coll).Upsert(ctx, i, &doc); err != nil {
+					t.Fatal(err)
+				}
+			}
+			for _, desc := range []bool{false, true} {
+				q := func() *QueryBuilder[bson.M] {
+					if desc {
+						return Query[bson.M](db, coll).WithOrderDesc("bio").WithLimit(10)
+					}
+					return Query[bson.M](db, coll).WithOrder("bio").WithLimit(10)
+				}
+				seen, cursor := 0, ""
+				var err error
+				for range 10 { // 25 docs need 3 pages; a stuck cursor must not hang
+					var page []bson.M
+					if page, cursor, err = q().WithCursor(cursor).SelectWithCursor(ctx); err != nil || len(page) == 0 {
+						break
+					}
+					seen += len(page)
+				}
+				if err == nil || !strings.Contains(err.Error(), `"bio"`) {
+					t.Errorf("desc=%v: paging ended after %d of 25 docs with %v, want a sort-field error", desc, seen, err)
+				}
+			}
+		})
 	}
 }
 

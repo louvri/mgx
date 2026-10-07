@@ -20,6 +20,9 @@
 //   - There are no namespaces and no ancestor queries; MongoDB has neither.
 //   - Cursors are keyset tokens built by mgx, not server cursors. See
 //     [QueryBuilder.SelectWithCursor] for what that requires of the data.
+//     Datastore leaves out an entity that lacks a sort property; mgx fails
+//     the page instead, since MongoDB sorts such a document rather than
+//     dropping it.
 //   - OpNotEqual and OpNotIn also match documents that lack the field.
 //     Datastore skips those; MongoDB does not.
 //   - A transaction is carried by the context, so mgx calls made with the
@@ -35,7 +38,6 @@ import (
 	"math"
 	"reflect"
 	"slices"
-	"sort"
 	"strconv"
 	"strings"
 
@@ -109,7 +111,7 @@ type DB struct {
 	// The client's encoding settings, for the documents and ids mgx encodes
 	// itself; see [DB.marshal].
 	registry *bson.Registry
-	bsonOpts *options.BSONOptions
+	encode   []func(*bson.Encoder)
 }
 
 // Option configures [Connect].
@@ -165,8 +167,36 @@ func Connect(uri, database string, opts ...Option) (*DB, error) {
 		client:   client,
 		db:       client.Database(database),
 		registry: merged.Registry,
-		bsonOpts: merged.BSONOptions,
+		encode:   encoderSetters(merged.BSONOptions),
 	}, nil
+}
+
+// encoderSetters returns the Encoder methods that o switches on, mirroring
+// mongo.getEncoder. Decode-only options are not listed.
+func encoderSetters(o *options.BSONOptions) []func(*bson.Encoder) {
+	if o == nil {
+		return nil
+	}
+	var on []func(*bson.Encoder)
+	for _, e := range []struct {
+		set bool
+		fn  func(*bson.Encoder)
+	}{
+		{o.ErrorOnInlineDuplicates, (*bson.Encoder).ErrorOnInlineDuplicates},
+		{o.IntMinSize, (*bson.Encoder).IntMinSize},
+		{o.NilByteSliceAsEmpty, (*bson.Encoder).NilByteSliceAsEmpty},
+		{o.NilMapAsEmpty, (*bson.Encoder).NilMapAsEmpty},
+		{o.NilSliceAsEmpty, (*bson.Encoder).NilSliceAsEmpty},
+		{o.OmitZeroStruct, (*bson.Encoder).OmitZeroStruct},
+		{o.OmitEmpty, (*bson.Encoder).OmitEmpty},
+		{o.StringifyMapKeysWithFmt, (*bson.Encoder).StringifyMapKeysWithFmt},
+		{o.UseJSONStructTags, (*bson.Encoder).UseJSONStructTags},
+	} {
+		if e.set {
+			on = append(on, e.fn)
+		}
+	}
+	return on
 }
 
 // marshal encodes v as the driver encodes documents for this client,
@@ -177,25 +207,8 @@ func Connect(uri, database string, opts ...Option) (*DB, error) {
 func (db *DB) marshal(v any) (bson.Raw, error) {
 	var buf bytes.Buffer
 	enc := bson.NewEncoder(bson.NewDocumentWriter(&buf))
-	if o := db.bsonOpts; o != nil {
-		for _, f := range []struct {
-			on  bool
-			set func()
-		}{
-			{o.ErrorOnInlineDuplicates, enc.ErrorOnInlineDuplicates},
-			{o.IntMinSize, enc.IntMinSize},
-			{o.NilByteSliceAsEmpty, enc.NilByteSliceAsEmpty},
-			{o.NilMapAsEmpty, enc.NilMapAsEmpty},
-			{o.NilSliceAsEmpty, enc.NilSliceAsEmpty},
-			{o.OmitZeroStruct, enc.OmitZeroStruct},
-			{o.OmitEmpty, enc.OmitEmpty},
-			{o.StringifyMapKeysWithFmt, enc.StringifyMapKeysWithFmt},
-			{o.UseJSONStructTags, enc.UseJSONStructTags},
-		} {
-			if f.on {
-				f.set()
-			}
-		}
+	for _, set := range db.encode {
+		set(enc)
 	}
 	if db.registry != nil {
 		enc.SetRegistry(db.registry)
@@ -233,11 +246,19 @@ type sortKey struct {
 // A QueryBuilder is mutable and is not safe for concurrent use. Build one per
 // operation; they are cheap.
 //
-// Filters, ordering, projection and pagination describe a query, so they
-// apply to Select, SelectWithCursor, Get, Count, Delete, [SelectIDs] and
-// [Distinct]. The write terminals (Upsert, UpsertMulti, Insert, InsertMulti)
-// address documents by id and use only the collection; they reject a builder
-// carrying any of those settings rather than ignore it.
+// Filters, ordering, projection and pagination describe a query, and Select
+// and SelectWithCursor honour all of them. The other terminals follow one
+// rule: a setting that cannot change their result is ignored, and one that
+// would change what they act on is rejected rather than ignored.
+//
+//   - Get ignores a limit; it returns one document either way.
+//   - [SelectIDs] replaces the projection with _id alone.
+//   - Count, Delete and [Distinct] ignore projection, and ordering apart from
+//     Count checking a cursor against it.
+//   - Delete and Distinct reject a limit, offset or cursor, which the server
+//     cannot apply to them.
+//   - The write terminals (Upsert, UpsertMulti, Insert, InsertMulti) address
+//     documents by id, so they reject every one of these settings.
 type QueryBuilder[T any] struct {
 	db         *DB
 	coll       string
@@ -444,7 +465,8 @@ func (qb *QueryBuilder[T]) projectionDoc(extra []sortKey) bson.D {
 type plan struct {
 	filter bson.D
 	sort   bson.D
-	keys   []sortKey // non-nil only for cursor pagination
+	keys   []sortKey       // non-nil only for cursor pagination
+	after  []bson.RawValue // the cursor's sort values, when resuming
 }
 
 // plan resolves the query for the terminal op. Its errors are wrapped.
@@ -469,11 +491,12 @@ func (qb *QueryBuilder[T]) resolve(keyset bool) (plan, error) {
 		p.keys = qb.keysetOrder()
 		p.sort = sortDoc(p.keys)
 		if qb.cursor != "" {
-			after, err := afterFilter(p.keys, qb.cursor)
+			after, vals, err := afterFilter(p.keys, qb.cursor, keyset)
 			if err != nil {
 				return plan{}, err
 			}
 			clauses = append(clauses, after)
+			p.after = vals
 		}
 	}
 	switch len(clauses) {
@@ -505,44 +528,147 @@ func keyNames(keys []sortKey) []string {
 	return names
 }
 
-func encodeCursor(keys []sortKey, last bson.Raw) (string, error) {
-	tok := cursorToken{Keys: keyNames(keys), Values: make([]bson.RawValue, len(keys))}
-	for i, k := range keys {
-		v, err := last.LookupErr(strings.Split(k.field, ".")...)
-		if err != nil || v.Type == bson.TypeNull || v.Type == bson.TypeUndefined {
-			return "", fmt.Errorf("mgx: cannot build a cursor: sort field %q is missing or null in a result", k.field)
-		}
-		// An array sorts by one of its elements, but compares as a whole or
-		// element-wise in a filter, so no range condition resumes after it.
-		if v.Type == bson.TypeArray {
-			return "", fmt.Errorf("mgx: cannot build a cursor: sort field %q holds an array in a result", k.field)
-		}
-		tok.Values[i] = bson.RawValue{Type: v.Type, Value: append([]byte(nil), v.Value...)}
+// pager checks each result of a cursor query and keeps the last one's sort
+// values, from which the next cursor is built.
+type pager struct {
+	keys  []sortKey
+	paths [][]string
+	vals  []bson.RawValue // the result being checked; aliases it
+	last  []bson.RawValue // the previous result's, or the cursor's; owned
+}
+
+// newPager starts a page, resuming from the cursor's values when after is
+// set.
+func newPager(keys []sortKey, after []bson.RawValue) *pager {
+	pg := &pager{
+		keys:  keys,
+		paths: make([][]string, len(keys)),
+		vals:  make([]bson.RawValue, len(keys)),
+		last:  make([]bson.RawValue, len(keys)),
 	}
-	b, err := bson.Marshal(tok)
+	for i, k := range keys {
+		pg.paths[i] = strings.Split(k.field, ".")
+	}
+	for i, v := range after {
+		pg.last[i] = bson.RawValue{Type: v.Type, Value: slices.Clone(v.Value)}
+	}
+	return pg
+}
+
+// add checks one result. Every result is checked, not only the last, so one
+// that cannot be paged past fails wherever the page boundary falls. Errors
+// are left for the caller to wrap.
+func (pg *pager) add(doc bson.Raw) error {
+	tied := true // the keys before i equal the previous result's
+	for i, k := range pg.keys {
+		v, err := pg.lookup(doc, i)
+		if err != nil {
+			return err
+		}
+		// Key i is compared only where the keys before it tie, so only there
+		// must it hold the type it is compared with. An appended _id of mixed
+		// types is fine under a unique sort field.
+		prev := pg.last[i]
+		if tied && prev.Type != 0 && typeClass(v.Type) != typeClass(prev.Type) {
+			return fmt.Errorf("cannot page: sort field %q holds both %s and %s values", k.field, prev.Type, v.Type)
+		}
+		tied = tied && prev.Type != 0 && mayTie(v, prev)
+		pg.vals[i] = v
+	}
+	for i, v := range pg.vals {
+		pg.last[i] = bson.RawValue{Type: v.Type, Value: append(pg.last[i].Value[:0], v.Value...)}
+	}
+	return nil
+}
+
+func (pg *pager) lookup(doc bson.Raw, i int) (bson.RawValue, error) {
+	field, path := pg.keys[i].field, pg.paths[i]
+	v, err := doc.LookupErr(path...)
 	if err != nil {
-		return "", fmt.Errorf("mgx: cannot build a cursor: %w", err)
+		// A dotted path through an array of documents is not found by
+		// LookupErr, but the field is there, and it is an array.
+		for j := 1; j < len(path); j++ {
+			if p, err := doc.LookupErr(path[:j]...); err == nil && p.Type == bson.TypeArray {
+				return v, fmt.Errorf("cannot page: sort field %q runs through an array in a result", field)
+			}
+		}
+		return v, fmt.Errorf("cannot page: sort field %q is missing in a result", field)
+	}
+	switch v.Type {
+	case bson.TypeNull, bson.TypeUndefined:
+		return v, fmt.Errorf("cannot page: sort field %q is null in a result", field)
+	case bson.TypeDouble, bson.TypeDecimal128:
+		// NaN equals nothing and is not ordered against numbers in a filter,
+		// so neither a page after it nor one before it can be asked for.
+		f, isDouble := v.DoubleOK()
+		d, isDecimal := v.Decimal128OK()
+		if (isDouble && math.IsNaN(f)) || (isDecimal && d.IsNaN()) {
+			return v, fmt.Errorf("cannot page: sort field %q is NaN in a result", field)
+		}
+	case bson.TypeArray:
+		// An array sorts by one of its elements, but compares as a whole or
+		// element-wise in a filter, so no condition resumes after it.
+		return v, fmt.Errorf("cannot page: sort field %q holds an array in a result", field)
+	}
+	return v, nil
+}
+
+// mayTie reports whether two sort values can sort as equal. idKey tells
+// int32, int64 and whole doubles apart exactly; other numbers of different
+// types are taken to tie, so the next key is checked rather than skipped.
+func mayTie(a, b bson.RawValue) bool {
+	if idKey(a) == idKey(b) {
+		return true
+	}
+	return a.Type != b.Type && typeClass(a.Type) == bson.TypeDouble && typeClass(b.Type) == bson.TypeDouble
+}
+
+// cursor encodes the last result's position. Call it only after an add.
+func (pg *pager) cursor() (string, error) {
+	b, err := bson.Marshal(cursorToken{Keys: keyNames(pg.keys), Values: pg.last})
+	if err != nil {
+		return "", fmt.Errorf("cannot build a cursor: %w", err)
 	}
 	return base64.RawURLEncoding.EncodeToString(b), nil
 }
 
-// afterFilter turns a cursor into the condition "sorts after that document".
-// For keys (a, b, c) and values (x, y, z) that is
+// typeClass groups the BSON types that compare with each other by value.
+func typeClass(t bson.Type) bson.Type {
+	switch t {
+	case bson.TypeInt32, bson.TypeInt64, bson.TypeDecimal128:
+		return bson.TypeDouble
+	case bson.TypeSymbol:
+		return bson.TypeString
+	}
+	return t
+}
+
+// afterFilter turns a cursor into the condition "sorts after that document",
+// and returns the cursor's values. For keys (a, b, c) and values (x, y, z)
+// that is
 //
 //	a > x  OR  (a = x AND b > y)  OR  (a = x AND b = y AND c > z)
 //
 // with < in place of > for a descending key.
-func afterFilter(keys []sortKey, cursor string) (bson.D, error) {
+//
+// When strict, each > is sent as "not <=" and each < as "not >=". For values
+// of the cursor's type that is the same condition, but it also matches what
+// a comparison never does: a missing or null field, an array, and a value of
+// another type. Those sort among the rest, so a plain > or < would skip them
+// without a trace. Matched, they surface in the next page, where the pager
+// rejects them. Only SelectWithCursor runs the pager, so only it is strict;
+// elsewhere they would be returned, some from before the cursor.
+func afterFilter(keys []sortKey, cursor string, strict bool) (bson.D, []bson.RawValue, error) {
 	b, err := base64.RawURLEncoding.DecodeString(cursor)
 	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidCursor, err)
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidCursor, err)
 	}
 	var tok cursorToken
 	if err := bson.Unmarshal(b, &tok); err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrInvalidCursor, err)
+		return nil, nil, fmt.Errorf("%w: %w", ErrInvalidCursor, err)
 	}
 	if want := keyNames(keys); len(tok.Values) != len(want) || !slices.Equal(tok.Keys, want) {
-		return nil, fmt.Errorf("%w: issued for order %v, used with %v", ErrInvalidCursor, tok.Keys, want)
+		return nil, nil, fmt.Errorf("%w: issued for order %v, used with %v", ErrInvalidCursor, tok.Keys, want)
 	}
 	or := make(bson.A, 0, len(keys))
 	for i, k := range keys {
@@ -550,14 +676,18 @@ func afterFilter(keys []sortKey, cursor string) (bson.D, error) {
 		for j, prev := range keys[:i] {
 			clause = append(clause, bson.E{Key: prev.field, Value: bson.D{{Key: "$eq", Value: tok.Values[j]}}})
 		}
-		op := "$gt"
+		op, notOp := "$gt", "$lte"
 		if k.desc {
-			op = "$lt"
+			op, notOp = "$lt", "$gte"
 		}
-		clause = append(clause, bson.E{Key: k.field, Value: bson.D{{Key: op, Value: tok.Values[i]}}})
+		cond := bson.D{{Key: op, Value: tok.Values[i]}}
+		if strict {
+			cond = bson.D{{Key: "$not", Value: bson.D{{Key: notOp, Value: tok.Values[i]}}}}
+		}
+		clause = append(clause, bson.E{Key: k.field, Value: cond})
 		or = append(or, clause)
 	}
-	return bson.D{{Key: "$or", Value: or}}, nil
+	return bson.D{{Key: "$or", Value: or}}, tok.Values, nil
 }
 
 func (qb *QueryBuilder[T]) findOptions(p plan) *options.FindOptionsBuilder {
@@ -603,12 +733,22 @@ func (qb *QueryBuilder[T]) Select(ctx context.Context) ([]T, error) {
 // values and the next page asks for documents that sort after them. It costs
 // the same at any depth, and it needs three things of the data:
 //
-//   - every sort field is present, non-null and not an array on every
-//     matching document;
-//   - each sort field holds one BSON type across documents, because range
-//     comparisons do not cross types the way sorting does;
+//   - every sort field is present, non-null, not NaN and not an array on
+//     every matching document;
+//   - each sort field holds one type (all numeric types count as one) across
+//     the documents that tie on the fields before it, because a range
+//     condition does not cross types the way sorting does. For the first
+//     field that is every matching document; the _id mgx appends may mix
+//     types under a unique field;
 //   - an index that covers the filter and the full ordering, ending in _id,
 //     which mgx appends as a tie-breaker.
+//
+// A page holding a document that breaks the first two fails with an error.
+// Paging never skips such a document silently: the next page is asked for
+// everything that does not sort before the cursor, so one of another type
+// surfaces in it rather than being passed over. The other terminals given a
+// cursor apply it as a plain range condition, which leaves such documents
+// out rather than reporting them.
 //
 // The cursor is not signed or encrypted. It can only move a reader within the
 // results of the query it is used with, but treat it as client-controlled
@@ -627,14 +767,16 @@ func (qb *QueryBuilder[T]) SelectWithCursor(ctx context.Context) ([]T, string, e
 	defer func() { _ = cur.Close(ctx) }()
 
 	out := []T{}
-	var last bson.Raw
+	pg := newPager(p.keys, p.after)
 	for cur.Next(ctx) {
+		if err := pg.add(cur.Current); err != nil {
+			return nil, "", qb.wrap("select", err)
+		}
 		var v T
 		if err := cur.Decode(&v); err != nil {
 			return nil, "", qb.wrap("select", err)
 		}
 		out = append(out, v)
-		last = append(last[:0], cur.Current...)
 	}
 	if err := cur.Err(); err != nil {
 		return nil, "", qb.wrap("select", err)
@@ -642,7 +784,7 @@ func (qb *QueryBuilder[T]) SelectWithCursor(ctx context.Context) ([]T, string, e
 	if len(out) == 0 {
 		return out, qb.cursor, nil
 	}
-	next, err := encodeCursor(p.keys, last)
+	next, err := pg.cursor()
 	if err != nil {
 		return nil, "", qb.wrap("select", err)
 	}
@@ -781,26 +923,54 @@ func Distinct[V, T any](ctx context.Context, qb *QueryBuilder[T], field string) 
 	return out, nil
 }
 
-func checkID(id any) error {
+// checkID checks an id as it is encoded for the server, so anything that
+// encodes as null is caught, however it got there: a nil pointer, map or
+// slice at any depth, or a type the client's registry writes as null. Such an
+// id would address the one document whose _id is null.
+func (db *DB) checkID(id any) error {
 	if id == nil {
 		return errors.New("id is nil")
 	}
-	// A nil pointer, map or slice is encoded as null and would address the
-	// one document whose _id is null.
-	rv := reflect.ValueOf(id)
-	switch rv.Kind() {
-	case reflect.Pointer, reflect.Map, reflect.Slice:
-		if rv.IsNil() {
-			return fmt.Errorf("id is a nil %T", id)
+	raw, err := db.marshal(bson.D{{Key: FieldID, Value: id}})
+	if err != nil {
+		return err
+	}
+	v, err := raw.LookupErr(FieldID)
+	if err != nil {
+		return err
+	}
+	return checkRawID(v)
+}
+
+// checkRawID checks an encoded id.
+func checkRawID(v bson.RawValue) error {
+	switch v.Type {
+	case bson.TypeNull, bson.TypeUndefined:
+		return errors.New("id is null")
+	case bson.TypeString:
+		if s, ok := v.StringValueOK(); !ok || s == "" {
+			return errors.New("id is empty") // Firestore rejects an empty-string _id
 		}
 	}
-	if rv.Kind() == reflect.Pointer {
-		rv = rv.Elem()
-	}
-	if rv.Kind() == reflect.String && rv.Len() == 0 {
-		return errors.New("id is empty") // Firestore rejects an empty-string _id
-	}
 	return nil
+}
+
+// encodeIDs encodes ids as a $in sends them and checks each.
+func encodeIDs[K any](db *DB, ids []K) ([]bson.RawValue, error) {
+	raw, err := db.marshal(bson.D{{Key: "ids", Value: ids}})
+	if err != nil {
+		return nil, err
+	}
+	encoded, err := raw.Lookup("ids").Array().Values()
+	if err != nil {
+		return nil, err
+	}
+	for i, v := range encoded {
+		if err := checkRawID(v); err != nil {
+			return nil, fmt.Errorf("id %d: %w", i, err)
+		}
+	}
+	return encoded, nil
 }
 
 func idFilter(id any) bson.D {
@@ -845,13 +1015,28 @@ func (qb *QueryBuilder[T]) writable(op string) error {
 	return nil
 }
 
+// insertDoc encodes data for an insert and checks the _id it carries, if any;
+// without one the driver generates an ObjectID.
+func (db *DB) insertDoc(data any) (bson.Raw, error) {
+	raw, err := db.marshal(data)
+	if err != nil {
+		return nil, err
+	}
+	if id, err := raw.LookupErr(FieldID); err == nil {
+		if err := checkRawID(id); err != nil {
+			return nil, err
+		}
+	}
+	return raw, nil
+}
+
 // Upsert replaces the document with the given id, or inserts it. The id
 // argument wins over any _id held in data.
 func (qb *QueryBuilder[T]) Upsert(ctx context.Context, id any, data *T) error {
 	if err := qb.writable("upsert"); err != nil {
 		return err
 	}
-	if err := checkID(id); err != nil {
+	if err := qb.db.checkID(id); err != nil {
 		return qb.wrap("upsert", err)
 	}
 	if data == nil {
@@ -870,8 +1055,9 @@ func (qb *QueryBuilder[T]) Upsert(ctx context.Context, id any, data *T) error {
 // UpsertMulti upserts documents keyed by string id, in requests of 500.
 //
 // Ids are written in sorted order, so batch boundaries are stable across runs
-// and a failure names the batch it happened in. Each request is independent:
-// a failure part-way through leaves the batches before it applied. For other
+// and a failure names the batch it happened in. Each request is independent
+// and unordered: a failure part-way through leaves the batches before it
+// applied, and may leave some documents of the failing batch applied too. For other
 // id types, or for all-or-nothing, loop over Upsert inside [RunInTransaction].
 func (qb *QueryBuilder[T]) UpsertMulti(ctx context.Context, items map[string]*T) error {
 	if err := qb.writable("upsert-multi"); err != nil {
@@ -884,7 +1070,7 @@ func (qb *QueryBuilder[T]) UpsertMulti(ctx context.Context, items map[string]*T)
 		}
 		ids = append(ids, id)
 	}
-	sort.Strings(ids)
+	slices.Sort(ids)
 
 	for start := 0; start < len(ids); start += maxWriteBatch {
 		end := min(start+maxWriteBatch, len(ids))
@@ -916,7 +1102,11 @@ func (qb *QueryBuilder[T]) Insert(ctx context.Context, data *T) (any, error) {
 	if data == nil {
 		return nil, qb.wrap("insert", errors.New("document is nil"))
 	}
-	res, err := qb.c().InsertOne(ctx, data)
+	doc, err := qb.db.insertDoc(data)
+	if err != nil {
+		return nil, qb.wrap("insert", err)
+	}
+	res, err := qb.c().InsertOne(ctx, doc)
 	if err != nil {
 		return nil, qb.wrap("insert", err)
 	}
@@ -929,7 +1119,8 @@ func (qb *QueryBuilder[T]) Insert(ctx context.Context, data *T) (any, error) {
 // error, such as a duplicate key, that includes the failed request's
 // documents before the one rejected. Otherwise, such as on a timeout or a
 // dropped connection, the failed request may or may not have been applied
-// and none of its ids are returned.
+// and none of its ids are returned. A document whose _id is null or empty is
+// caught as its request is built, so the requests before it stay applied.
 func (qb *QueryBuilder[T]) InsertMulti(ctx context.Context, items []*T) ([]any, error) {
 	if err := qb.writable("insert-multi"); err != nil {
 		return nil, err
@@ -940,9 +1131,18 @@ func (qb *QueryBuilder[T]) InsertMulti(ctx context.Context, items []*T) ([]any, 
 		}
 	}
 	ids := make([]any, 0, len(items))
+	docs := make([]bson.Raw, 0, min(maxWriteBatch, len(items)))
 	for start := 0; start < len(items); start += maxWriteBatch {
 		end := min(start+maxWriteBatch, len(items))
-		res, err := qb.c().InsertMany(ctx, items[start:end])
+		docs = docs[:0]
+		for i, it := range items[start:end] {
+			doc, err := qb.db.insertDoc(it)
+			if err != nil {
+				return ids, qb.wrap("insert-multi", fmt.Errorf("document %d: %w", start+i, err))
+			}
+			docs = append(docs, doc)
+		}
+		res, err := qb.c().InsertMany(ctx, docs)
 		if res != nil {
 			ids = append(ids, res.InsertedIDs...)
 		}
@@ -955,7 +1155,7 @@ func (qb *QueryBuilder[T]) InsertMulti(ctx context.Context, items []*T) ([]any, 
 
 // GetByID returns the document with the given id, or [ErrNotFound].
 func GetByID[T any](ctx context.Context, db *DB, collection string, id any) (*T, error) {
-	if err := checkID(id); err != nil {
+	if err := db.checkID(id); err != nil {
 		return nil, fmt.Errorf("mgx: get %s: %w", collection, err)
 	}
 	var v T
@@ -973,7 +1173,8 @@ func GetByID[T any](ctx context.Context, db *DB, collection string, id any) (*T,
 // query whatever their BSON width, so 1 as int32, int64 and double share a
 // key here too; otherwise a result could not be matched to the id that asked
 // for it. A whole double in int64 range converts exactly, so it shares the
-// key of the int64 with the same value.
+// key of the int64 with the same value. The pager uses it to tell whether two
+// sort values tie.
 func idKey(v bson.RawValue) string {
 	switch v.Type {
 	case bson.TypeInt32:
@@ -996,30 +1197,26 @@ func GetMulti[T, K any](ctx context.Context, db *DB, collection string, ids []K)
 	if len(ids) == 0 {
 		return out, nil
 	}
-	for i, id := range ids {
-		if err := checkID(id); err != nil {
-			return nil, fmt.Errorf("mgx: get-multi %s: id %d: %w", collection, i, err)
-		}
-	}
 	// Encoded once, as the $in sends them, to key each result to its slots.
-	raw, err := db.marshal(bson.D{{Key: "ids", Value: ids}})
+	encoded, err := encodeIDs(db, ids)
 	if err != nil {
 		return nil, fmt.Errorf("mgx: get-multi %s: %w", collection, err)
 	}
-	encoded, err := raw.Lookup("ids").Array().Values()
-	if err != nil {
-		return nil, fmt.Errorf("mgx: get-multi %s: %w", collection, err)
-	}
-	index := make(map[string][]int, len(ids)) // an id may be asked for twice
+	// An id may be asked for twice; it is fetched once and fills every slot.
+	index := make(map[string][]int, len(ids))
+	distinct := make([]K, 0, len(ids))
 	for i, v := range encoded {
 		k := idKey(v)
+		if _, seen := index[k]; !seen {
+			distinct = append(distinct, ids[i])
+		}
 		index[k] = append(index[k], i)
 	}
 	coll := db.Collection(collection)
-	for start := 0; start < len(ids); start += maxLookupBatch {
-		end := min(start+maxLookupBatch, len(ids))
-		if err := getBatch(ctx, coll, ids[start:end], index, out); err != nil {
-			return nil, fmt.Errorf("mgx: get-multi %s [%d:%d]: %w", collection, start, end, err)
+	for start := 0; start < len(distinct); start += maxLookupBatch {
+		end := min(start+maxLookupBatch, len(distinct))
+		if err := getBatch(ctx, coll, distinct[start:end], index, out); err != nil {
+			return nil, fmt.Errorf("mgx: get-multi %s: distinct ids [%d:%d]: %w", collection, start, end, err)
 		}
 	}
 	return out, nil
@@ -1047,7 +1244,7 @@ func getBatch[T, K any](ctx context.Context, coll *mongo.Collection, ids []K, in
 // DeleteByID removes the document with the given id. Removing a document
 // that does not exist is not an error.
 func DeleteByID(ctx context.Context, db *DB, collection string, id any) error {
-	if err := checkID(id); err != nil {
+	if err := db.checkID(id); err != nil {
 		return fmt.Errorf("mgx: delete %s: %w", collection, err)
 	}
 	if _, err := db.Collection(collection).DeleteOne(ctx, idFilter(id)); err != nil {
@@ -1059,10 +1256,8 @@ func DeleteByID(ctx context.Context, db *DB, collection string, id any) error {
 // DeleteMultiByID removes the documents with the given ids, 500 per request,
 // and returns how many were removed.
 func DeleteMultiByID[K any](ctx context.Context, db *DB, collection string, ids []K) (int64, error) {
-	for i, id := range ids {
-		if err := checkID(id); err != nil {
-			return 0, fmt.Errorf("mgx: delete-multi %s: id %d: %w", collection, i, err)
-		}
+	if _, err := encodeIDs(db, ids); err != nil {
+		return 0, fmt.Errorf("mgx: delete-multi %s: %w", collection, err)
 	}
 	var n int64
 	coll := db.Collection(collection)
