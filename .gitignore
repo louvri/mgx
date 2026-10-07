@@ -29,5 +29,10 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
+.DS_Store
+
+# Claude Code (local agent instructions and settings)
+CLAUDE.md
+.claude/
