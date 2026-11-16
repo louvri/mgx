@@ -471,11 +471,12 @@ func TestConnect(t *testing.T) {
 func TestUpsertMultiByIDRejectsBadItems(t *testing.T) {
 	db := offline(t)
 	ctx := context.Background()
-	if err := UpsertMultiByID(ctx, Query[user](db, "u"), map[int64]*user{1: {}, 2: nil}); err == nil {
-		t.Error("nil document accepted")
+	// Each refusal names the id it refused, quoted when it is a string.
+	if err := UpsertMultiByID(ctx, Query[user](db, "u"), map[int64]*user{1: {}, 2: nil}); err == nil || !strings.Contains(err.Error(), "id 2 has a nil document") {
+		t.Errorf("nil document: %v", err)
 	}
-	if err := UpsertMultiByID(ctx, Query[user](db, "u"), map[string]*user{"u1": {}, "": {}}); err == nil {
-		t.Error("empty id accepted")
+	if err := UpsertMultiByID(ctx, Query[user](db, "u"), map[string]*user{"u1": {}, "": {}}); err == nil || !strings.Contains(err.Error(), `id "": id is empty`) {
+		t.Errorf("empty id: %v", err)
 	}
 }
 
@@ -584,9 +585,10 @@ func seed(t *testing.T, db *DB, ctx context.Context, coll string, n int) {
 	}
 }
 
-// Documents keyed by an int64 are stored under that int64 _id, not its text,
-// so an int64 id addresses them anywhere else; a second upsert replaces one
-// rather than adding it. 1203 documents cross two write-batch boundaries.
+// Documents keyed by an int64 are stored under an int64 _id (the client's
+// default encoding), not its text, so an int64 id addresses them anywhere else;
+// a second upsert replaces one rather than adding it. 1203 documents cross two
+// write-batch boundaries.
 func TestLiveUpsertMultiByID(t *testing.T) {
 	db, ctx := live(t)
 	coll := fresh(t, db, ctx)
@@ -618,18 +620,29 @@ func TestLiveUpsertMultiByID(t *testing.T) {
 	// A call it must refuse sends nothing: not the good items beside a bad
 	// one, nor the items of a builder carrying a filter it cannot honour.
 	// MongoDB, unlike Firestore, would store an empty-string _id.
-	if _, err := Query[order](db, coll+"_s").Delete(ctx); err != nil {
-		t.Fatal(err)
+	for _, c := range []string{coll + "_s", coll + "_u"} {
+		if _, err := Query[order](db, c).Delete(ctx); err != nil {
+			t.Fatal(err)
+		}
 	}
-	// The nil document sorts into the second batch, past 500 good ones.
+	// The nil document and the one the client cannot encode each sort into
+	// the second batch, past 500 good ones.
 	withNil := map[int64]*order{6501: nil}
 	for id := range int64(500) {
 		withNil[6001+id] = &order{Name: "x"}
 	}
+	type loose struct {
+		Bad any `bson:"bad,omitempty"`
+	}
+	unencodable := map[int64]*loose{6501: {Bad: make(chan int)}}
+	for id := range int64(500) {
+		unencodable[6001+id] = &loose{}
+	}
 	refused := map[string]error{
-		"a nil document": UpsertMultiByID(ctx, Query[order](db, coll), withNil),
-		"an empty id":    UpsertMultiByID(ctx, Query[order](db, coll+"_s"), map[string]*order{"": {Name: "x"}, "ok": {Name: "y"}}),
-		"a filter":       UpsertMultiByID(ctx, Query[order](db, coll).WithFilter("name", OpEqual, "n1"), map[int64]*order{5003: {Name: "x"}}),
+		"a nil document":          UpsertMultiByID(ctx, Query[order](db, coll), withNil),
+		"an empty id":             UpsertMultiByID(ctx, Query[order](db, coll+"_s"), map[string]*order{"": {Name: "x"}, "ok": {Name: "y"}}),
+		"a filter":                UpsertMultiByID(ctx, Query[order](db, coll).WithFilter("name", OpEqual, "n1"), map[int64]*order{5003: {Name: "x"}}),
+		"an unencodable document": UpsertMultiByID(ctx, Query[loose](db, coll+"_u"), unencodable),
 	}
 	for name, err := range refused {
 		if err == nil {
@@ -641,6 +654,9 @@ func TestLiveUpsertMultiByID(t *testing.T) {
 	}
 	if n, err := Query[order](db, coll+"_s").Count(ctx); err != nil || n != 0 {
 		t.Errorf("%d documents written by a call with an empty id, %v; want 0", n, err)
+	}
+	if n, err := Query[order](db, coll+"_u").Count(ctx); err != nil || n != 0 {
+		t.Errorf("%d documents written by a call with an unencodable document, %v; want 0", n, err)
 	}
 }
 
