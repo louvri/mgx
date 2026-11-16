@@ -8,7 +8,9 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -657,6 +659,71 @@ func TestLiveUpsertMultiByID(t *testing.T) {
 	}
 	if n, err := Query[order](db, coll+"_u").Count(ctx); err != nil || n != 0 {
 		t.Errorf("%d documents written by a call with an unencodable document, %v; want 0", n, err)
+	}
+}
+
+// The documents go over the wire once each, in id order, at most 500 to a
+// request. The stored state cannot show this: a request resending earlier
+// documents replaces them with themselves, but Firestore bills every write.
+func TestLiveUpsertMultiByIDSendsEachDocumentOnce(t *testing.T) {
+	uri := os.Getenv("MGX_TEST_URI")
+	if uri == "" {
+		t.Skip("MGX_TEST_URI not set")
+	}
+	ctx := context.Background()
+	coll := "c_upsert_wire"
+	var mu sync.Mutex
+	var requests [][]int64
+	db, err := Connect(uri, testDB(), WithClientOptions(options.Client().SetMonitor(&event.CommandMonitor{
+		Started: func(_ context.Context, e *event.CommandStartedEvent) {
+			if e.CommandName != "update" || e.Command.Lookup("update").StringValue() != coll {
+				return
+			}
+			updates, _ := e.Command.Lookup("updates").Array().Values()
+			ids := make([]int64, len(updates))
+			for i, u := range updates {
+				ids[i] = u.Document().Lookup("u", FieldID).Int64()
+			}
+			mu.Lock()
+			requests = append(requests, ids)
+			mu.Unlock()
+		},
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Collection(coll).DeleteMany(ctx, bson.D{})
+		_ = db.Close(ctx)
+	})
+	type order struct {
+		Name string `bson:"name"`
+	}
+	items := make(map[int64]*order, 1203)
+	for id := range int64(1203) {
+		items[id+1] = &order{Name: "x"}
+	}
+	if err := UpsertMultiByID(ctx, Query[order](db, coll), items); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	sizes := make([]int, len(requests))
+	var sent []int64
+	for i, ids := range requests {
+		sizes[i] = len(ids)
+		sent = append(sent, ids...)
+	}
+	if !slices.Equal(sizes, []int{500, 500, 203}) {
+		t.Errorf("update requests carry %v documents; want [500 500 203]", sizes)
+	}
+	want := make([]int64, 1203)
+	for i := range want {
+		want[i] = int64(i + 1)
+	}
+	if !slices.Equal(sent, want) {
+		t.Errorf("sent %d ids; want 1..1203, each once and in order", len(sent))
 	}
 }
 
