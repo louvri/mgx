@@ -439,6 +439,9 @@ func TestWritesRejectQuerySettings(t *testing.T) {
 		if err := qb.UpsertMulti(ctx, map[string]*user{"u1": {}}); err == nil {
 			t.Errorf("upsert-multi with a %s should be rejected", name)
 		}
+		if err := UpsertMultiByID(ctx, qb, map[int64]*user{1: {}}); err == nil {
+			t.Errorf("upsert-multi by id with a %s should be rejected", name)
+		}
 		if _, err := qb.Insert(ctx, &user{}); err == nil {
 			t.Errorf("insert with a %s should be rejected", name)
 		}
@@ -461,6 +464,19 @@ func TestConnect(t *testing.T) {
 		t.Fatalf("firestore OIDC uri rejected: %v", err)
 	}
 	_ = db.Close(context.Background())
+}
+
+// A batch upsert refuses an item it cannot address before sending anything:
+// a nil document, or an empty id, which Firestore rejects.
+func TestUpsertMultiByIDRejectsBadItems(t *testing.T) {
+	db := offline(t)
+	ctx := context.Background()
+	if err := UpsertMultiByID(ctx, Query[user](db, "u"), map[int64]*user{1: {}, 2: nil}); err == nil {
+		t.Error("nil document accepted")
+	}
+	if err := UpsertMultiByID(ctx, Query[user](db, "u"), map[string]*user{"u1": {}, "": {}}); err == nil {
+		t.Error("empty id accepted")
+	}
 }
 
 // ---- integration tests: set MGX_TEST_URI to run ----
@@ -565,6 +581,66 @@ func seed(t *testing.T, db *DB, ctx context.Context, coll string, n int) {
 	}
 	if err := Query[user](db, coll).UpsertMulti(ctx, items); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Documents keyed by an int64 are stored under that int64 _id, not its text,
+// so an int64 id addresses them anywhere else; a second upsert replaces one
+// rather than adding it. 1203 documents cross two write-batch boundaries.
+func TestLiveUpsertMultiByID(t *testing.T) {
+	db, ctx := live(t)
+	coll := fresh(t, db, ctx)
+	type order struct {
+		ID   int64  `bson:"_id,omitempty"`
+		Name string `bson:"name"`
+	}
+	items := make(map[int64]*order, 1203)
+	for id := range int64(1203) {
+		items[id+1] = &order{Name: fmt.Sprintf("n%d", id+1)}
+	}
+	if err := UpsertMultiByID(ctx, Query[order](db, coll), items); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertMultiByID(ctx, Query[order](db, coll), map[int64]*order{7: {Name: "seven"}}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := Query[order](db, coll).Count(ctx); err != nil || n != 1203 {
+		t.Errorf("count = %d, %v; want 1203", n, err)
+	}
+	if got, err := GetByID[order](ctx, db, coll, int64(7)); err != nil || got.ID != 7 || got.Name != "seven" {
+		t.Errorf("get 7 = %+v, %v; want the replacement", got, err)
+	}
+	longIDs := bson.D{{Key: FieldID, Value: bson.D{{Key: "$type", Value: "long"}}}}
+	if n, err := Query[order](db, coll).WithRawFilter(longIDs).Count(ctx); err != nil || n != 1203 {
+		t.Errorf("%d ids stored as int64, %v; want 1203", n, err)
+	}
+
+	// A call it must refuse sends nothing: not the good items beside a bad
+	// one, nor the items of a builder carrying a filter it cannot honour.
+	// MongoDB, unlike Firestore, would store an empty-string _id.
+	if _, err := Query[order](db, coll+"_s").Delete(ctx); err != nil {
+		t.Fatal(err)
+	}
+	// The nil document sorts into the second batch, past 500 good ones.
+	withNil := map[int64]*order{6501: nil}
+	for id := range int64(500) {
+		withNil[6001+id] = &order{Name: "x"}
+	}
+	refused := map[string]error{
+		"a nil document": UpsertMultiByID(ctx, Query[order](db, coll), withNil),
+		"an empty id":    UpsertMultiByID(ctx, Query[order](db, coll+"_s"), map[string]*order{"": {Name: "x"}, "ok": {Name: "y"}}),
+		"a filter":       UpsertMultiByID(ctx, Query[order](db, coll).WithFilter("name", OpEqual, "n1"), map[int64]*order{5003: {Name: "x"}}),
+	}
+	for name, err := range refused {
+		if err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	if n, err := Query[order](db, coll).Count(ctx); err != nil || n != 1203 {
+		t.Errorf("count after refused calls = %d, %v; want 1203", n, err)
+	}
+	if n, err := Query[order](db, coll+"_s").Count(ctx); err != nil || n != 0 {
+		t.Errorf("%d documents written by a call with an empty id, %v; want 0", n, err)
 	}
 }
 

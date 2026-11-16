@@ -1069,21 +1069,40 @@ func (qb *QueryBuilder[T]) Upsert(ctx context.Context, id any, data *T) error {
 	return nil
 }
 
-// UpsertMulti upserts documents keyed by string id, in requests of 500.
+// UpsertMulti upserts documents keyed by string id, in requests of 500; see
+// [UpsertMultiByID], which takes ids of other types.
+func (qb *QueryBuilder[T]) UpsertMulti(ctx context.Context, items map[string]*T) error {
+	return UpsertMultiByID(ctx, qb, items)
+}
+
+// OrderedID is an id type UpsertMultiByID takes: a string or a signed integer,
+// which sort, and which BSON stores as themselves. Floats are left out: a NaN
+// key cannot be looked up in its own map.
+type OrderedID interface {
+	~string | ~int | ~int32 | ~int64
+}
+
+// UpsertMultiByID upserts documents keyed by id, in requests of 500. The id is
+// stored as its own type, so documents keyed by an int64 elsewhere are
+// addressed by the same _id. It is a function, not a method, since a method
+// cannot add the id's type parameter.
 //
 // Ids are written in sorted order, so batch boundaries are stable across runs
 // and a failure names the batch it happened in. Each request is independent
 // and unordered: a failure part-way through leaves the batches before it
-// applied, and may leave some documents of the failing batch applied too. For other
-// id types, or for all-or-nothing, loop over Upsert inside [RunInTransaction].
-func (qb *QueryBuilder[T]) UpsertMulti(ctx context.Context, items map[string]*T) error {
+// applied, and may leave some documents of the failing batch applied too. For
+// all-or-nothing, loop over Upsert inside [RunInTransaction].
+func UpsertMultiByID[T any, K OrderedID](ctx context.Context, qb *QueryBuilder[T], items map[K]*T) error {
 	if err := qb.writable("upsert-multi"); err != nil {
 		return err
 	}
-	ids := make([]string, 0, len(items))
+	ids := make([]K, 0, len(items))
 	for id, data := range items {
-		if id == "" || data == nil {
-			return qb.wrap("upsert-multi", fmt.Errorf("id %q is empty or has a nil document", id))
+		if data == nil {
+			return qb.wrap("upsert-multi", fmt.Errorf("id %v has a nil document", id))
+		}
+		if err := qb.db.checkID(id); err != nil {
+			return qb.wrap("upsert-multi", fmt.Errorf("id %v: %w", id, err))
 		}
 		ids = append(ids, id)
 	}
@@ -1103,7 +1122,7 @@ func (qb *QueryBuilder[T]) UpsertMulti(ctx context.Context, items map[string]*T)
 		// Collection.BulkWrite sends plain update commands. Client.BulkWrite
 		// uses the bulkWrite command, which Firestore does not list as supported.
 		if _, err := qb.c().BulkWrite(ctx, models, options.BulkWrite().SetOrdered(false)); err != nil {
-			return qb.wrap("upsert-multi", fmt.Errorf("batch [%s..%s]: %w", ids[start], ids[end-1], err))
+			return qb.wrap("upsert-multi", fmt.Errorf("batch [%v..%v]: %w", ids[start], ids[end-1], err))
 		}
 	}
 	return nil
