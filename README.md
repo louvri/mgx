@@ -127,6 +127,7 @@ users := mgx.Query[User](db, "users")
 
 err := users.Upsert(ctx, "user-123", &user)                 // replace or insert; the id argument wins over data's _id
 err  = users.UpsertMulti(ctx, map[string]*User{"a": &a, "b": &b})
+err  = mgx.UpsertMultiByID(ctx, orders, map[int64]*Order{1: &o1, 2: &o2}) // string or integer ids
 id, err  := users.Insert(ctx, &user)                        // ObjectID generated when data has no _id
 ids, err := users.InsertMulti(ctx, []*User{&a, &b})         // on error, the ids that did go in are returned too
 
@@ -135,7 +136,7 @@ err  = mgx.DeleteByID(ctx, db, "users", "user-123")                   // deletin
 n, err := mgx.DeleteMultiByID(ctx, db, "users", []string{"a", "b"})
 ```
 
-The write calls address documents by id only, so a builder carrying a filter, ordering, projection or pagination is rejected rather than having it silently ignored - a dropped tenant filter would otherwise overwrite another tenant's document. A nil or empty id is rejected everywhere, including inside the batch calls, since a nil pointer would otherwise address the document whose `_id` is null. Batch writes go in requests of 500 and lookups in requests of 1000. Each request is independent, so a failure part-way leaves earlier batches applied. `UpsertMulti` batches are also unordered, so some documents of the failing batch may be applied too. For all-or-nothing, write inside a transaction.
+The write calls address documents by id only, so a builder carrying a filter, ordering, projection or pagination is rejected rather than having it silently ignored - a dropped tenant filter would otherwise overwrite another tenant's document. A nil or empty id is rejected everywhere, including inside the batch calls, since a nil pointer would otherwise address the document whose `_id` is null. Batch writes go in requests of 500 and lookups in requests of 1000. Each request is independent, so a failure part-way leaves earlier batches applied. `UpsertMulti` and `UpsertMultiByID` batches are also unordered, so some documents of the failing batch may be applied too. `UpsertMultiByID` takes string or signed-integer ids, each encoded as the client encodes that Go type (an `int` is int32 when it fits, and the `IntMinSize` BSON option narrows an `int64` too; a query on the `_id` finds it either way). It checks every id and encodes every document before sending any batch, so an item it cannot write fails the call with nothing written. For all-or-nothing, write inside a transaction.
 
 ## Transactions
 

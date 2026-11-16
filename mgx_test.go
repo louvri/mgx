@@ -8,7 +8,9 @@ import (
 	"math"
 	"os"
 	"reflect"
+	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -439,6 +441,9 @@ func TestWritesRejectQuerySettings(t *testing.T) {
 		if err := qb.UpsertMulti(ctx, map[string]*user{"u1": {}}); err == nil {
 			t.Errorf("upsert-multi with a %s should be rejected", name)
 		}
+		if err := UpsertMultiByID(ctx, qb, map[int64]*user{1: {}}); err == nil {
+			t.Errorf("upsert-multi by id with a %s should be rejected", name)
+		}
 		if _, err := qb.Insert(ctx, &user{}); err == nil {
 			t.Errorf("insert with a %s should be rejected", name)
 		}
@@ -461,6 +466,20 @@ func TestConnect(t *testing.T) {
 		t.Fatalf("firestore OIDC uri rejected: %v", err)
 	}
 	_ = db.Close(context.Background())
+}
+
+// A batch upsert refuses an item it cannot address before sending anything:
+// a nil document, or an empty id, which Firestore rejects.
+func TestUpsertMultiByIDRejectsBadItems(t *testing.T) {
+	db := offline(t)
+	ctx := context.Background()
+	// Each refusal names the id it refused, quoted when it is a string.
+	if err := UpsertMultiByID(ctx, Query[user](db, "u"), map[int64]*user{1: {}, 2: nil}); err == nil || !strings.Contains(err.Error(), "id 2 has a nil document") {
+		t.Errorf("nil document: %v", err)
+	}
+	if err := UpsertMultiByID(ctx, Query[user](db, "u"), map[string]*user{"u1": {}, "": {}}); err == nil || !strings.Contains(err.Error(), `id "": id is empty`) {
+		t.Errorf("empty id: %v", err)
+	}
 }
 
 // ---- integration tests: set MGX_TEST_URI to run ----
@@ -565,6 +584,146 @@ func seed(t *testing.T, db *DB, ctx context.Context, coll string, n int) {
 	}
 	if err := Query[user](db, coll).UpsertMulti(ctx, items); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// Documents keyed by an int64 are stored under an int64 _id (the client's
+// default encoding), not its text, so an int64 id addresses them anywhere else;
+// a second upsert replaces one rather than adding it. 1203 documents cross two
+// write-batch boundaries.
+func TestLiveUpsertMultiByID(t *testing.T) {
+	db, ctx := live(t)
+	coll := fresh(t, db, ctx)
+	type order struct {
+		ID   int64  `bson:"_id,omitempty"`
+		Name string `bson:"name"`
+	}
+	items := make(map[int64]*order, 1203)
+	for id := range int64(1203) {
+		items[id+1] = &order{Name: fmt.Sprintf("n%d", id+1)}
+	}
+	if err := UpsertMultiByID(ctx, Query[order](db, coll), items); err != nil {
+		t.Fatal(err)
+	}
+	if err := UpsertMultiByID(ctx, Query[order](db, coll), map[int64]*order{7: {Name: "seven"}}); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := Query[order](db, coll).Count(ctx); err != nil || n != 1203 {
+		t.Errorf("count = %d, %v; want 1203", n, err)
+	}
+	if got, err := GetByID[order](ctx, db, coll, int64(7)); err != nil || got.ID != 7 || got.Name != "seven" {
+		t.Errorf("get 7 = %+v, %v; want the replacement", got, err)
+	}
+	longIDs := bson.D{{Key: FieldID, Value: bson.D{{Key: "$type", Value: "long"}}}}
+	if n, err := Query[order](db, coll).WithRawFilter(longIDs).Count(ctx); err != nil || n != 1203 {
+		t.Errorf("%d ids stored as int64, %v; want 1203", n, err)
+	}
+
+	// A call it must refuse sends nothing: not the good items beside a bad
+	// one, nor the items of a builder carrying a filter it cannot honour.
+	// MongoDB, unlike Firestore, would store an empty-string _id.
+	for _, c := range []string{coll + "_s", coll + "_u"} {
+		if _, err := Query[order](db, c).Delete(ctx); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// The nil document and the one the client cannot encode each sort into
+	// the second batch, past 500 good ones.
+	withNil := map[int64]*order{6501: nil}
+	for id := range int64(500) {
+		withNil[6001+id] = &order{Name: "x"}
+	}
+	type loose struct {
+		Bad any `bson:"bad,omitempty"`
+	}
+	unencodable := map[int64]*loose{6501: {Bad: make(chan int)}}
+	for id := range int64(500) {
+		unencodable[6001+id] = &loose{}
+	}
+	refused := map[string]error{
+		"a nil document":          UpsertMultiByID(ctx, Query[order](db, coll), withNil),
+		"an empty id":             UpsertMultiByID(ctx, Query[order](db, coll+"_s"), map[string]*order{"": {Name: "x"}, "ok": {Name: "y"}}),
+		"a filter":                UpsertMultiByID(ctx, Query[order](db, coll).WithFilter("name", OpEqual, "n1"), map[int64]*order{5003: {Name: "x"}}),
+		"an unencodable document": UpsertMultiByID(ctx, Query[loose](db, coll+"_u"), unencodable),
+	}
+	for name, err := range refused {
+		if err == nil {
+			t.Errorf("%s accepted", name)
+		}
+	}
+	if n, err := Query[order](db, coll).Count(ctx); err != nil || n != 1203 {
+		t.Errorf("count after refused calls = %d, %v; want 1203", n, err)
+	}
+	if n, err := Query[order](db, coll+"_s").Count(ctx); err != nil || n != 0 {
+		t.Errorf("%d documents written by a call with an empty id, %v; want 0", n, err)
+	}
+	if n, err := Query[order](db, coll+"_u").Count(ctx); err != nil || n != 0 {
+		t.Errorf("%d documents written by a call with an unencodable document, %v; want 0", n, err)
+	}
+}
+
+// The documents go over the wire once each, in id order, at most 500 to a
+// request. The stored state cannot show this: a request resending earlier
+// documents replaces them with themselves, but Firestore bills every write.
+func TestLiveUpsertMultiByIDSendsEachDocumentOnce(t *testing.T) {
+	uri := os.Getenv("MGX_TEST_URI")
+	if uri == "" {
+		t.Skip("MGX_TEST_URI not set")
+	}
+	ctx := context.Background()
+	coll := "c_upsert_wire"
+	var mu sync.Mutex
+	var requests [][]int64
+	db, err := Connect(uri, testDB(), WithClientOptions(options.Client().SetMonitor(&event.CommandMonitor{
+		Started: func(_ context.Context, e *event.CommandStartedEvent) {
+			if e.CommandName != "update" || e.Command.Lookup("update").StringValue() != coll {
+				return
+			}
+			updates, _ := e.Command.Lookup("updates").Array().Values()
+			ids := make([]int64, len(updates))
+			for i, u := range updates {
+				ids[i] = u.Document().Lookup("u", FieldID).Int64()
+			}
+			mu.Lock()
+			requests = append(requests, ids)
+			mu.Unlock()
+		},
+	})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_, _ = db.Collection(coll).DeleteMany(ctx, bson.D{})
+		_ = db.Close(ctx)
+	})
+	type order struct {
+		Name string `bson:"name"`
+	}
+	items := make(map[int64]*order, 1203)
+	for id := range int64(1203) {
+		items[id+1] = &order{Name: "x"}
+	}
+	if err := UpsertMultiByID(ctx, Query[order](db, coll), items); err != nil {
+		t.Fatal(err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	sizes := make([]int, len(requests))
+	var sent []int64
+	for i, ids := range requests {
+		sizes[i] = len(ids)
+		sent = append(sent, ids...)
+	}
+	if !slices.Equal(sizes, []int{500, 500, 203}) {
+		t.Errorf("update requests carry %v documents; want [500 500 203]", sizes)
+	}
+	want := make([]int64, 1203)
+	for i := range want {
+		want[i] = int64(i + 1)
+	}
+	if !slices.Equal(sent, want) {
+		t.Errorf("sent %d ids; want 1..1203, each once and in order", len(sent))
 	}
 }
 
